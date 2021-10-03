@@ -19,11 +19,8 @@ typedef struct http_url_trie_node_s http_url_trie_node_t;
 typedef struct http_server_s http_server_t;
 typedef enum llhttp_method http_method_t;
 typedef struct http_context_s http_context_t;
-typedef struct http_fd_queue_s http_fd_queue_t;
-typedef struct http_fd_queue_node_s http_fd_queue_node_t;
 
-typedef unsigned int (*http_handler_t)(http_context_t *context);
-
+typedef void (*http_handler_t)(http_context_t *context);
 typedef void (*http_err_handler)(int err);
 
 struct http_string_s {
@@ -52,10 +49,17 @@ struct http_request_s {
 struct http_response_s {
     http_headers_t headers;
     http_string_t body;
+    int status_code;
 };
 
 typedef enum {
-    HTTP_CONTEXT_STATE_PARSING = 0,
+    HTTP_CONTEXT_FLAG_KEEPALIVE = 1,
+    HTTP_CONTEXT_FLAG_CHUNKED = 2
+} http_context_flag_t;
+
+typedef enum {
+    HTTP_CONTEXT_STATE_WAIT = 0,
+    HTTP_CONTEXT_STATE_PARSE,
     HTTP_CONTEXT_STATE_HANDLING,
     HTTP_CONTEXT_STATE_PENDING,
     HTTP_CONTEXT_STATE_RESPONSE,
@@ -71,13 +75,12 @@ struct http_context_s {
     http_request_t request;
     http_response_t response;
     http_context_state_t state;
-    ev_io write_watcher;
+    int requests;
     size_t write_ptr;
     char *buffer;
     size_t buffer_ptr;
     size_t buffer_capacity;
-    char ready_to_close;
-    int flags;
+    unsigned int flags;
 };
 
 struct http_url_trie_node_s {
@@ -86,7 +89,7 @@ struct http_url_trie_node_s {
     http_handler_t handler;
 };
 
-// TODO: bind address, limit size
+// TODO: bind address
 struct http_server_s {
     ev_io tcp_watcher;
     struct ev_loop *loop;
@@ -94,24 +97,28 @@ struct http_server_s {
     http_url_trie_node_t url_root;
     llhttp_settings_t parser_settings;
     http_err_handler err_handler;
+    http_handler_t before_parse;
+    http_handler_t before_dispatch;
+    http_handler_t post_response;
+    http_handler_t before_close;
+    int connections;
     // settings
     int port;
     // limit
     int max_connections;
-    int max_context;
-    size_t client_timeout;
-    size_t max_url_len;
-    size_t max_headers_size;
-    size_t max_body_size;
+    int max_request;
+    int client_timeout;
+    int max_request_size;
 };
 
 http_server_t *http_create_server(void);
 int http_register_url(http_server_t *server, const char *url, http_handler_t handler);
 int http_server_run_multi_process(http_server_t *server, int process);
-int http_server_run_multi_thread(http_server_t *server, int threads);
+// int http_server_run_multi_thread(http_server_t *server, int threads);
 int http_server_run_single_process(http_server_t *server);
-unsigned int http_send_file(http_context_t *context, const char *path, const char *index);
-void http_complete(http_context_t *context);
-void http_set_async(http_context_t *context);
+void http_send_dir(http_context_t *context, const char *path, const char *index);
+void http_close_connection(http_context_t *context);
+void http_response(http_context_t *context);
+// void http_write_chunk(http_context_t* context, http_string_t chunk);
 
 #endif //TEST_C_HTTP_H

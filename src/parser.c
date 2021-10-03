@@ -1,5 +1,6 @@
 #include "http.h"
 #include "context.h"
+#include "parser.h"
 #include <stdlib.h>
 #include <errno.h>
 
@@ -28,7 +29,7 @@ int header_field_cb(llhttp_t *parser, const char *at, size_t length) {
             if (context->server->err_handler != NULL) {
                 context->server->err_handler(errno);
             }
-            context->ready_to_close = 0x7f;
+            close_context(context);
             return -1;
         }
         headers->fields = new_fields;
@@ -55,6 +56,19 @@ int body_cb(llhttp_t *parser, const char *at, size_t length) {
 }
 
 int message_complete_cb(llhttp_t *parser) {
-    http_dispatch(get_context_from_parser(parser));
+    http_context_t *context = get_context_from_parser(parser);
+    context->requests += 1;
+    http_server_t *server = context->server;
+    // stop read callback
+    ev_io_stop(server->loop, &context->watcher);
+    // call before_dispatch()
+    if (server->before_dispatch != NULL) {
+        server->before_dispatch(context);
+        if (context->state == HTTP_CONTEXT_STATE_CLOSED) {
+            return 0;
+        }
+    }
+    // dispatch
+    http_dispatch(context);
     return 0;
 }

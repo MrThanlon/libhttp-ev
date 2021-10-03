@@ -8,6 +8,7 @@
 #include "event_callback.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <stddef.h>
@@ -32,22 +33,132 @@
 #define DEBUG 0
 
 /**
- * Call this to indicate handle finished.
+ * Close connection.
  * @param context
  */
-void http_complete(http_context_t *context) {
-    context->state = HTTP_CONTEXT_STATE_RESPONSE;
-    // TODO: generate header string
-    // TODO: use callback to write response
+void http_close_connection(http_context_t *context) {
+    // context->state = HTTP_CONTEXT_STATE_CLOSED;
     close_context(context);
 }
 
 /**
- * Set context async mode.
+ * Response to client.
  * @param context
  */
-void http_set_async(http_context_t *context) {
-    context->state = HTTP_CONTEXT_STATE_PENDING;
+void http_response(http_context_t *context) {
+    if (context->flags & HTTP_CONTEXT_FLAG_CHUNKED) {
+        // error: should use write_chunk(), TODO: handler error
+        return;
+    }
+    context->state = HTTP_CONTEXT_STATE_RESPONSE;
+    // generate headers string
+    if (context->response.status_code > 511) {
+        context->response.status_code = 500;
+    }
+    const char *status_message = get_status_message(context->response.status_code);
+    size_t status_message_len = strlen(status_message);
+    if (context->response.status_code != 200 && context->response.body.len == 0) {
+        // TODO: use custom error page
+        context->response.body.data = (unsigned char *) status_message;
+        context->response.body.len = status_message_len;
+    }
+    // check headers len, "HTTP/1.1 xxx xxx\r\n" + "Content-Length: xxx\r\n"
+    size_t headers_len = 15 + status_message_len + 18 + (size_t) log10((double) context->response.body.len);
+    // keep-alive
+    if (context->server->max_request != 0) {
+        // "Connection: keep-alive\r\n"
+        headers_len += 24;
+        if (context->server->max_request > 0) {
+            // "Keep-Alive: timeout=xx, max=xx\r\n"
+            headers_len += 28 +
+                           (size_t) log10((double) context->server->max_request) +
+                           (size_t) log10((double) context->server->client_timeout);
+        }
+    } else {
+        // "Connection: close\r\n"
+        headers_len += 19;
+    }
+    // TODO: Accept-Ranges
+    for (size_t i = 0; i < context->response.headers.len; i++) {
+        headers_len += context->response.headers.fields[i].key.len +
+                       context->response.headers.fields[i].value.len + 4;
+    }
+    if (context->buffer_capacity < headers_len) {
+        // expansion
+        context->buffer_capacity = headers_len;
+        char *new_buffer = realloc(context->buffer, headers_len);
+        if (new_buffer == NULL) {
+            if (context->server->err_handler != NULL) {
+                context->server->err_handler(errno);
+            }
+            close_context(context);
+            return;
+        }
+        context->buffer = new_buffer;
+    }
+    // first line and Content-Length
+    context->buffer_ptr = sprintf(context->buffer,
+                                  "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n",
+                                  context->response.status_code,
+                                  status_message,
+                                  context->response.body.len);
+    // keep-alive
+    if (context->server->max_request != 0) {
+        // "Connection: keep-alive\r\n"
+        memcpy(context->buffer + context->buffer_ptr, "Connection: keep-alive\r\n", 24);
+        context->buffer_ptr += 24;
+        if (context->server->max_request > 0) {
+            // "Keep-Alive: timeout=xx, max=xx\r\n"
+            context->buffer_ptr += sprintf(context->buffer + context->buffer_ptr,
+                                           "Keep-Alive: timeout=%d, max=%d",
+                                           context->server->client_timeout,
+                                           context->server->max_request);
+        }
+    } else {
+        // "Connection: close\r\n"
+        memcpy(context->buffer + context->buffer_ptr, "Connection: close\r\n", 19);
+        context->buffer_ptr += 19;
+    }
+    // header fields
+    for (size_t i = 0; i < context->response.headers.len; i++) {
+        memcpy(context->buffer + context->buffer_ptr,
+               context->response.headers.fields[i].key.data,
+               context->response.headers.fields[i].key.len);
+        context->buffer_ptr += context->response.headers.fields[i].key.len;
+        memcpy(context->buffer + context->buffer_ptr, ": ", 2);
+        context->buffer_ptr += 2;
+        memcpy(context->buffer + context->buffer_ptr,
+               context->response.headers.fields[i].value.data,
+               context->response.headers.fields[i].value.len);
+        context->buffer_ptr += context->response.headers.fields[i].value.len;
+        memcpy(context->buffer + context->buffer_ptr, "\r\n", 2);
+        context->buffer_ptr += 2;
+    }
+    // last CRLF
+    memcpy(context->buffer + context->buffer_ptr, "\r\n", 2);
+    context->buffer_ptr += 2;
+    // ev
+    ev_io_init(&context->watcher, watcher_cb, context->watcher.fd, EV_WRITE);
+    ev_io_start(context->server->loop, &context->watcher);
+}
+
+/**
+ * Response with Transfer-Encoding: chunked
+ * @param context
+ * @param chunk
+ */
+void http_write_chunk(http_context_t *context, http_string_t chunk) {
+    context->flags |= HTTP_CONTEXT_FLAG_CHUNKED;
+    if (context->state != HTTP_CONTEXT_STATE_RESPONSE) {
+        // TODO: write headers
+        context->state = HTTP_CONTEXT_STATE_RESPONSE;
+    }
+    char buffer[10];
+    // to hex str
+    int len = sprintf(buffer, "%zX\r\n", chunk.len);
+    write(context->watcher.fd, buffer, len);
+    write(context->watcher.fd, chunk.data, chunk.len);
+    write(context->watcher.fd, "\r\n", 2);
 }
 
 /**
@@ -185,9 +296,8 @@ static const char *get_mime_string(const char *postfix_name) {
  * @param context
  * @param path Must be absolute path, `/a/b/c` for example.
  * @param index Default index, `index.html` for example, NULL if not used.
- * @return status code
  */
-unsigned int http_send_file(http_context_t *context, const char *path, const char *index) {
+void http_send_dir(http_context_t *context, const char *path, const char *index) {
     // simplify URL path
     const char *cur = ".";
     const char *fa = "..";
@@ -197,7 +307,6 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     size_t stack_ptr = 0;
     size_t st = 1;
     unsigned char *url = context->request.url.data;
-    // FIXME: edge condition
     for (size_t i = 1; i <= context->request.url.len; i++) {
         if (url[i] != '/' && url[i - 1] == '/') {
             // start dir
@@ -223,7 +332,8 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     for (; path[path_ptr] != '\0'; path_ptr++) {
         if (path_ptr >= PATH_MAX) {
             // too long
-            return 400;
+            context->response.status_code = 400;
+            return;
         }
         real_path[path_ptr] = path[path_ptr];
     }
@@ -231,7 +341,8 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     for (size_t i = 0; i < stack_ptr; i++) {
         real_path[path_ptr++] = '/';
         if (path_ptr + stack_len[i] >= PATH_MAX) {
-            return 400;
+            context->response.status_code = 400;
+            return;
         }
         memcpy(real_path + path_ptr, url + stack_head[i], stack_len[i]);
         path_ptr += stack_len[i];
@@ -240,8 +351,8 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     // check file and get length
     struct stat file_stat;
     if (stat(real_path, &file_stat)) {
-        // not found
-        return 404;
+        context->response.status_code = 404;
+        return;
     }
     if (S_ISREG(file_stat.st_mode)) {
         // file, do nothing
@@ -250,30 +361,36 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
         if (real_path[path_ptr - 1] != '/') {
             real_path[path_ptr++] = '/';
             if (path_ptr >= PATH_MAX) {
-                return 404;
+                context->response.status_code = 404;
+                return;
             }
         }
         if (index == NULL) {
             // forbidden
-            return 403;
+            context->response.status_code = 403;
+            return;
         }
         // append index
         for (size_t i = 0; index[i] != '\0'; i++) {
             real_path[path_ptr++] = index[i];
             if (path_ptr >= PATH_MAX) {
-                return 400;
+                context->response.status_code = 400;
+                return;
             }
         }
         if (stat(real_path, &file_stat)) {
-            return 403;
+            context->response.status_code = 403;
+            return;
         }
     } else {
         // not found
-        return 404;
+        context->response.status_code = 404;
+        return;
     }
     int fd = open(real_path, O_RDONLY);
     if (fd < 0) {
-        return 404;
+        context->response.status_code = 404;
+        return;
     }
     // get MIME for Content-Type
     size_t postfix_dot = path_ptr;
@@ -292,7 +409,7 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     do {
         headers_ptr += write(context->watcher.fd, headers_str + headers_ptr, headers_len - headers_ptr);
     } while (headers_ptr < headers_len);
-    context->ready_to_close = 0x7f;
+    reset_context(context);
 #endif
 
     // macOS and linux `sendfile` is different.
@@ -313,7 +430,8 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
             if (context->server->err_handler != NULL) {
                 context->server->err_handler(err);
             }
-            return 500;
+            context->response.status_code = 500;
+            return;
         }
         file_ptr += file_len;
         file_len = file_stat.st_size - file_len;
@@ -328,11 +446,12 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
             if (context->server->err_handler != NULL) {
                 context->server->err_handler(err);
             }
-            return 500;
+            context->response.status_code = 400;
+            return;
         }
         file_len -= file_ptr;
     } while (file_ptr < file_stat.st_size);
-    context->ready_to_close = 0x7f;
+    reset_context(context);
 #else
     // set Content-Type
     static http_header_field_t *content_type = NULL;
@@ -353,8 +472,6 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     context->response.body.len = file_stat.st_size;
     read(fd, context->response.body.data, file_stat.st_size);
 #endif
-    close(fd);
-    return 200;
 }
 
 /**
@@ -375,13 +492,16 @@ http_server_t *http_create_server(void) {
     server->parser_settings.on_body = body_cb;
     server->parser_settings.on_message_complete = message_complete_cb;
     server->err_handler = NULL;
+    server->before_parse = NULL;
+    server->before_dispatch = NULL;
+    server->post_response = NULL;
+    server->before_close = NULL;
     // default settings
     server->port = 80;
     server->max_connections = 100;
-    server->max_context = 100;
-    server->max_url_len = 4096;
-    server->max_headers_size = 102400; // 100K
-    server->max_body_size = 1048576; // 1M
+    server->max_request = 10;
+    server->client_timeout = 30;
+    server->max_request_size = 1048576; // 1M
     return server;
 }
 
@@ -390,7 +510,6 @@ char this_process_is_master = 0;
 
 static void sig_handler(int sig) {
     if (this_process_server != NULL) {
-        // FIXME: should use ev_break()
         close(this_process_server->socket_fd);
     }
     if (this_process_is_master) {
@@ -533,6 +652,7 @@ int http_server_run_multi_process(http_server_t *server, int process) {
     return errno;
 }
 
+/*
 void *thread_job(void *s) {
     http_server_t *server = (http_server_t *) s;
     // create new loop
@@ -542,36 +662,36 @@ void *thread_job(void *s) {
     ev_io_start(loop, &tcp_watcher);
     ev_run(loop, 0);
     return NULL;
-}
+}*/
 
 /**
- * TODO: Run server in multi-thread mode.
+ * Run server in multi-thread mode.
  * @param server Server instance
  * @param threads Number of threads
  * @return
  */
+/*
 int http_server_run_multi_thread(http_server_t *server, int threads) {
-    server->socket_fd = http_server_listen(server);
-    if (server->socket_fd < 0) {
-        return errno;
-    }
-    // TODO: pthread_create()
-    pthread_t t[threads];
-    for (int i = 0; i < threads; i++) {
-        int ret = pthread_create(&t[i], NULL, thread_job, server);
-        if (ret) {
-            if (server->err_handler != NULL) {
-                server->err_handler(ret);
-            }
-            // cancel
-            for (int j = 0; j < i; j++) {
-                pthread_cancel(t[j]);
-            }
-            return ret;
-        }
-    }
-    // TODO: wait
-}
+   server->socket_fd = http_server_listen(server);
+   if (server->socket_fd < 0) {
+       return errno;
+   }
+   pthread_t t[threads];
+   for (int i = 0; i < threads; i++) {
+       int ret = pthread_create(&t[i], NULL, thread_job, server);
+       if (ret) {
+           if (server->err_handler != NULL) {
+               server->err_handler(ret);
+           }
+           // cancel
+           for (int j = 0; j < i; j++) {
+               pthread_cancel(t[j]);
+           }
+           return ret;
+       }
+   }
+   // TODO: wait
+}*/
 
 /**
  * Run server in single-process mode.

@@ -8,7 +8,7 @@
 // FIXME: auto set BUFFER_SIZE
 #define BUFFER_SIZE 4096
 
-static const char *get_status_message(unsigned int status) {
+const char *get_status_message(unsigned int status) {
     switch (status) {
         case 100:
             return "Continue";
@@ -83,7 +83,7 @@ static const char *get_status_message(unsigned int status) {
         case 412:
             return "Precondition Failed";
         case 413:
-            return "Request Entity Too Large";
+            return "Payload Too Large";
         case 414:
             return "Request-URI Too Long";
         case 415:
@@ -144,13 +144,25 @@ static const char *get_status_message(unsigned int status) {
 }
 
 /**
- * Reset context but not free memory, for recycling context.
+ * Reset context to receive new request.
  * @param context
  */
-static void reset_context(http_context_t *context) {
-    context->ready_to_close = 0;
-    context->state = HTTP_CONTEXT_STATE_PARSING;
-    // reset parser
+void reset_context(http_context_t *context) {
+    // stop watcher
+    ev_io_stop(context->server->loop, &context->watcher);
+    // call hooks
+    if (context->server->post_response != NULL) {
+        context->server->post_response(context);
+    }
+    // check limitation
+    if (context->requests >= context->server->max_request) {
+        // close
+        close_context(context);
+        return;
+    }
+    // reset state
+    context->state = HTTP_CONTEXT_STATE_WAIT;
+    // parser
     llhttp_reset(&context->parser);
     // reset buffer, but not free memory
     context->buffer_ptr = 0;
@@ -161,19 +173,22 @@ static void reset_context(http_context_t *context) {
     // reset response
     context->response.headers.len = 0;
     context->response.body.len = 0;
+    // ev
+    ev_io_init(&context->watcher, watcher_cb, context->watcher.fd, EV_READ);
+    ev_io_start(context->server->loop, &context->watcher);
 }
 
 /**
  * Free context memory.
  * @param context
  */
-void free_context(http_context_t *context) {
+static void free_context(http_context_t *context) {
     free(context->request.headers.fields);
     free(context->buffer);
     free(context);
 }
 
-// TODO: use a better free policy, use lock-free queue
+// TODO: use pool to store unused context object.
 /**
  * Recycle used context to pool.
  * @param context
@@ -185,7 +200,7 @@ void recycle_context(http_context_t *context) {
 
 
 /**
- * Get a new context from pool, or create one. TODO: merge get new and create
+ * Get a new context from pool, or create one. Allocate memory for buffer.
  * @return context
  */
 http_context_t *get_new_context() {
@@ -211,7 +226,25 @@ http_context_t *get_new_context() {
     return context;
 }
 
-http_context_t *http_create_context(http_server_t* server, int socket_fd) {
+static http_context_t *get_context_from_timer(ev_timer *watcher) {
+    return (http_context_t *) ((void *) watcher - offsetof(http_context_t, timer));
+}
+
+static void timer_cb(struct ev_loop *loop, ev_timer *watcher, int revents) {
+    // timeout, close
+    ev_timer_stop(loop, watcher);
+    http_context_t *context = get_context_from_timer(watcher);
+    context->state = HTTP_CONTEXT_STATE_TIMEOUT;
+    close_context(context);
+}
+
+/**
+ * Create new context.
+ * @param server
+ * @param socket_fd
+ * @return
+ */
+http_context_t *http_create_context(http_server_t *server, int socket_fd) {
     http_context_t *context = get_new_context();
     if (context == NULL) {
         // failed, close
@@ -224,32 +257,34 @@ http_context_t *http_create_context(http_server_t* server, int socket_fd) {
     context->server = server;
     // init llhttp
     llhttp_init(&context->parser, HTTP_REQUEST, &server->parser_settings);
-    // join loop
-    ev_io_init(&context->watcher, tcp_read_cb, socket_fd, EV_READ);
+    // ev
+    // timer
+    ev_timer_init(&context->timer, timer_cb, server->client_timeout, 0);
+    ev_timer_start(server->loop, &context->timer);
+    // socket
+    ev_io_init(&context->watcher, watcher_cb, socket_fd, EV_READ);
     ev_io_start(server->loop, &context->watcher);
     return context;
 }
 
+/**
+ * Close socket, free memory, remove watcher from event loop.
+ * @param context
+ */
 void close_context(http_context_t *context) {
+    // call hooks
+    if (context->server->before_close != NULL) {
+        context->server->before_close(context);
+    }
     context->state = HTTP_CONTEXT_STATE_CLOSED;
     ev_io_stop(context->server->loop, &context->watcher);
     close(context->watcher.fd);
     recycle_context(context);
-    /*
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_BODY) && (context->response.body.data != NULL)) {
-        free(context->response.body.data);
-    }
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_HEADER) && (context->response.headers.fields != NULL)) {
-        free(context->response.headers.fields);
-    }
-    free(context->request.headers.fields);
-    free(context->buffer);
-    free(context);*/
 }
 
 
 /**
- * Dispatch context to handler. TODO: update
+ * Dispatch context to handler.
  * @param context
  */
 void http_dispatch(http_context_t *context) {
@@ -266,43 +301,12 @@ void http_dispatch(http_context_t *context) {
     }
     // run handler
     if (handler != NULL) {
-        // TODO: multi-threading
-        unsigned int status = handler(context);
-        if (context->state == HTTP_CONTEXT_STATE_PENDING) {
-            // just return
-            return;
-        }
-        if (context->ready_to_close) {
-            // already handled, return
-            return;
-        }
-        // TODO: use write callback
-        FILE *socket_f = fdopen(context->watcher.fd, "w");
-        fprintf(socket_f, "HTTP/1.1 %u %s\r\n", status, get_status_message(status));
-        for (size_t i = 0; i < context->response.headers.len; i++) {
-            fprintf(socket_f,
-                    "%.*s: %.*s\r\n",
-                    (int) context->response.headers.fields[i].key.len,
-                    context->response.headers.fields[i].key.data,
-                    (int) context->response.headers.fields[i].value.len,
-                    context->response.headers.fields[i].value.data
-            );
-        }
-        // body
-        if (status != 200 && context->response.body.len == 0) {
-            // FIXME: default err body
-            // Content-Length
-            fprintf(socket_f, "Content-Length: %zu\r\n\r\n", strlen(get_status_message(status)));
-            fputs(get_status_message(status), socket_f);
-        } else {
-            // Content-Length
-            fprintf(socket_f, "Content-Length: %zu\r\n\r\n", context->response.body.len);
-            fwrite(context->response.body.data, context->response.body.len, 1, socket_f);
-        }
-        fclose(socket_f);
+        context->state = HTTP_CONTEXT_STATE_HANDLING;
+        handler(context);
+        context->state = HTTP_CONTEXT_STATE_PENDING;
     } else {
         // 404
-        write(context->watcher.fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", 45);
+        context->response.status_code = 404;
+        http_response(context);
     }
-    context->ready_to_close = 0x7f;
 }

@@ -20,21 +20,33 @@ int set_non_block(int fd) {
     return 0;
 }
 
-void tcp_read_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
-    http_context_t *context = (http_context_t *) watcher;
-    if (EV_ERROR & revents) {
-        // error, close
-        close_context(context);
-        return;
+static void tcp_write_cb(http_context_t *context) {
+    // FIXME: one pass write(?)
+    if (context->write_ptr < context->buffer_ptr) {
+        // write buffer
+        context->write_ptr += write(context->watcher.fd,
+                                    context->buffer + context->write_ptr,
+                                    context->buffer_ptr - context->write_ptr);
     }
+    if (context->write_ptr >= context->buffer_ptr &&
+        context->write_ptr < context->buffer_ptr + context->response.body.len) {
+        // write response
+        size_t response_ptr = context->write_ptr - context->buffer_ptr;
+        context->write_ptr += write(context->watcher.fd,
+                                    context->response.body.data + response_ptr,
+                                    context->response.body.len - response_ptr);
+    }
+    if (context->write_ptr >= context->buffer_ptr + context->response.body.len) {
+        // finish
+        reset_context(context);
+    }
+}
+
+static void tcp_read_cb(http_context_t *context) {
     // receiving message
-    ssize_t bytes = read(watcher->fd,
+    ssize_t bytes = read(context->watcher.fd,
                          context->buffer + context->buffer_ptr,
                          context->buffer_capacity - context->buffer_ptr);
-    /*recv(watcher->fd,
-         context->buffer + context->buffer_ptr,
-         context->buffer_capacity - context->buffer_ptr,
-         0);*/
     if (bytes < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data, continue
@@ -47,12 +59,16 @@ void tcp_read_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
         close_context(context);
     } else if (bytes == 0) {
         // client close
-#if DEBUG
-        puts("client close");
-#endif
         close_context(context);
     } else {
         // received
+        // TODO: check header field size
+        if (context->buffer_ptr + bytes >= context->server->max_request_size) {
+            // exceed
+            context->response.status_code = 413;
+            http_response(context);
+            return;
+        }
         if (context->buffer_ptr + bytes >= context->buffer_capacity) {
             // expansion
             context->buffer_capacity += BUFFER_SIZE;
@@ -68,17 +84,14 @@ void tcp_read_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
             context->buffer = new_buffer;
         }
         // execute parser
+        context->state = HTTP_CONTEXT_STATE_PARSE;
         enum llhttp_errno err = llhttp_execute(&context->parser, context->buffer + context->buffer_ptr, bytes);
+        if (context->state == HTTP_CONTEXT_STATE_CLOSED) {
+            close_context(context);
+            return;
+        }
         if (err == HPE_OK) {
             context->buffer_ptr += bytes;
-            if (context->ready_to_close) {
-#if DEBUG
-                static size_t counts = 0;
-                counts += 1;
-                printf("context over, %zu request\n", counts);
-#endif
-                close_context(context);
-            }
         } else {
             // error, close
             if (context->server->err_handler != NULL) {
@@ -86,6 +99,21 @@ void tcp_read_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
             }
             close_context(context);
         }
+    }
+}
+
+void watcher_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
+    http_context_t *context = (http_context_t *) watcher;
+    if (revents & EV_ERROR) {
+        if (context->server->err_handler != NULL) {
+            context->server->err_handler(errno);
+        }
+        close_context(context);
+        return;
+    } else if (revents & EV_READ) {
+        tcp_read_cb(context);
+    } else {
+        tcp_write_cb(context);
     }
 }
 
@@ -111,6 +139,11 @@ void tcp_accept_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
         }
         return;
     }
+    if (server->connections >= server->max_connections) {
+        // close
+        close(client_fd);
+        return;
+    }
     if (set_non_block(client_fd)) {
         // failed to set non-block
         if (server->err_handler != NULL) {
@@ -119,6 +152,14 @@ void tcp_accept_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
         close(client_fd);
         return;
     }
-    // operate context, TODO: set timer
-    http_create_context(server, client_fd);
+    // operate context
+    http_context_t *context = http_create_context(server, client_fd);
+    if (context == NULL) {
+        // err
+        return;
+    }
+    server->connections += 1;
+    if (server->before_parse != NULL) {
+        server->before_parse(context);
+    }
 }
