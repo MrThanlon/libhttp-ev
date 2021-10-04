@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 // FIXME: auto set BUFFER_SIZE
 #define BUFFER_SIZE 4096
