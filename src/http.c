@@ -1,7 +1,3 @@
-//
-// Created by Ziyi Huang on 2021/9/21.
-//
-
 #include "http.h"
 #include "parser.h"
 #include "context.h"

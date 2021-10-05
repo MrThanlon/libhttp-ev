@@ -1,9 +1,9 @@
-//
-// Created by Ziyi Huang on 2021/9/21.
-//
-
 #ifndef TEST_C_HTTP_H
 #define TEST_C_HTTP_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <ev.h>
 #include <llhttp.h>
@@ -59,7 +59,7 @@ struct http_response_s {
 typedef enum {
     HTTP_CONTEXT_FLAG_KEEPALIVE = 1,
     HTTP_CONTEXT_FLAG_CHUNKED = 2,
-} http_context_flag_t;
+    } http_context_flag_t;
 
 typedef enum {
     HTTP_CONTEXT_STATE_WAIT = 0,
@@ -144,5 +144,9 @@ void http_close_connection(http_context_t *context);
 void http_response(http_context_t *context, http_handler_t handler);
 void http_ws_write(http_ws_t *ws, uint8_t opcode, const uint8_t *message, size_t len);
 // void http_write_chunk(http_context_t* context, http_string_t chunk);
+
+#ifdef __cplusplus
+};
+#endif
 
 #endif //TEST_C_HTTP_H
