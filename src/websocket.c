@@ -34,7 +34,7 @@ void ws_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
 #if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
     ev_io_modify(watcher, events);
 #else
-    ev_io_set(watcher, context->watcher.fd, events);
+    ev_io_set(watcher, watcher.fd, events);
 #endif
 }
 
