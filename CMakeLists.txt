@@ -25,11 +25,16 @@ target_link_libraries(${PROJECT_NAME} llhttp ev wslay nettle)
 
 # test
 enable_testing()
-find_package(GTest REQUIRED)
+FetchContent_Declare(
+        googletest
+        URL https://github.com/google/googletest/archive/609281088cfefc76f9d0ce82e1ff6c30cc3591e5.zip
+)
+FetchContent_MakeAvailable(googletest)
+# find_package(GTest REQUIRED)
 
 add_executable(test-${PROJECT_NAME} test/test.cpp)
 # target_compile_options(test-${PROJECT_NAME} PUBLIC --coverage)
-target_link_libraries(test-${PROJECT_NAME} ${GTEST_BOTH_LIBRARIES} ${PROJECT_NAME})
+target_link_libraries(test-${PROJECT_NAME} ${PROJECT_NAME} gtest gtest_main)
 target_include_directories(test-${PROJECT_NAME} PUBLIC ${GTEST_INCLUDE_DIRS} src)
 include(CMakeCXXInformation)
 include(GoogleTest)
