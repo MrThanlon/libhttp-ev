@@ -1,6 +1,7 @@
 #include "event_callback.h"
 #include "http.h"
 #include "context.h"
+#include "websocket.h"
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -67,7 +68,7 @@ static void tcp_read_cb(http_context_t *context) {
         if (context->buffer_ptr + bytes >= context->server->max_request_size) {
             // exceed
             context->response.status_code = 413;
-            http_response(context);
+            http_response(context, NULL);
             return;
         }
         if (context->buffer_ptr + bytes >= context->buffer_capacity) {
@@ -93,6 +94,18 @@ static void tcp_read_cb(http_context_t *context) {
         }
         if (err == HPE_OK) {
             context->buffer_ptr += bytes;
+        } else if (err == HPE_PAUSED_UPGRADE) {
+            // maybe websocket, handshake, stop context
+            if (ws_handshake(context)) {
+                // error, close
+                if (context->server->err_handler != NULL) {
+                    context->server->err_handler(errno);
+                }
+                close_context(context);
+                return;
+            }
+            // pending
+            context->state = HTTP_CONTEXT_STATE_PENDING;
         } else {
             // error, close
             if (context->server->err_handler != NULL) {

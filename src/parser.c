@@ -59,8 +59,7 @@ int message_complete_cb(llhttp_t *parser) {
     http_context_t *context = get_context_from_parser(parser);
     context->requests += 1;
     http_server_t *server = context->server;
-    // stop read callback
-    ev_io_stop(server->loop, &context->watcher);
+    // TODO: handle exceed data, part of HTTP/2
     // call before_dispatch()
     if (server->before_dispatch != NULL) {
         server->before_dispatch(context);

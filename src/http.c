@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <pthread.h>
 
 #if __APPLE__
 
@@ -48,7 +49,7 @@ void http_close_connection(http_context_t *context) {
  * Response to client.
  * @param context
  */
-void http_response(http_context_t *context) {
+void http_response(http_context_t *context, http_handler_t handler) {
     if (context->flags & HTTP_CONTEXT_FLAG_CHUNKED) {
         // error: should use write_chunk(), TODO: handler error
         return;
@@ -140,6 +141,8 @@ void http_response(http_context_t *context) {
     // last CRLF
     memcpy(context->buffer + context->buffer_ptr, "\r\n", 2);
     context->buffer_ptr += 2;
+    // handler
+    context->post_response_handler = handler;
     // ev
     ev_io_init(&context->watcher, watcher_cb, context->watcher.fd, EV_WRITE);
     ev_io_start(context->server->loop, &context->watcher);
@@ -191,11 +194,48 @@ int http_register_url(http_server_t *server, const char *url, http_handler_t han
                 }
                 return errno;
             }
+            bzero(node->children[offset], sizeof(http_url_trie_node_t));
         }
         node = node->children[offset];
         idx += 1;
     }
     node->handler = handler;
+    return 0;
+}
+
+/**
+ * Register a websocket handler to URL. FIXME: duplicate code
+ * @param server
+ * @param url
+ * @param handler
+ * @return
+ */
+int http_register_ws(http_server_t *server, const char *url, http_ws_handlers_t *handlers) {
+    // url[0] must be '/'
+    if (url[0] != '/') {
+        return -1;
+    }
+    // insert to trie node
+    http_url_trie_node_t *node = &server->url_root;
+    size_t idx = 1;
+    while (url[idx] >= '%' && url[idx] <= '~') {
+        char offset = (char) (url[idx] - '%');
+        if (node->children[offset] == NULL) {
+            // new node
+            node->children[offset] = malloc(sizeof(http_url_trie_node_t));
+            if (node->children[offset] == NULL) {
+                // error
+                if (server->err_handler != NULL) {
+                    server->err_handler(errno);
+                }
+                return errno;
+            }
+            bzero(node->children[offset], sizeof(http_url_trie_node_t));
+        }
+        node = node->children[offset];
+        idx += 1;
+    }
+    node->ws_handlers = handlers;
     return 0;
 }
 
@@ -294,6 +334,10 @@ static const char *get_mime_string(const char *postfix_name) {
     return ptr->text;
 }
 
+static void free_response(http_context_t *context) {
+    free(context->response.body.data);
+}
+
 /**
  * Handle static directories, return 404 if not found.
  * @param context
@@ -336,6 +380,7 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
         if (path_ptr >= PATH_MAX) {
             // too long
             context->response.status_code = 400;
+            http_response(context, NULL);
             return;
         }
         real_path[path_ptr] = path[path_ptr];
@@ -345,6 +390,7 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
         real_path[path_ptr++] = '/';
         if (path_ptr + stack_len[i] >= PATH_MAX) {
             context->response.status_code = 400;
+            http_response(context, NULL);
             return;
         }
         memcpy(real_path + path_ptr, url + stack_head[i], stack_len[i]);
@@ -355,6 +401,7 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
     struct stat file_stat;
     if (stat(real_path, &file_stat)) {
         context->response.status_code = 404;
+        http_response(context, NULL);
         return;
     }
     if (S_ISREG(file_stat.st_mode)) {
@@ -365,12 +412,14 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
             real_path[path_ptr++] = '/';
             if (path_ptr >= PATH_MAX) {
                 context->response.status_code = 404;
+                http_response(context, NULL);
                 return;
             }
         }
         if (index == NULL) {
             // forbidden
             context->response.status_code = 403;
+            http_response(context, NULL);
             return;
         }
         // append index
@@ -378,21 +427,25 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
             real_path[path_ptr++] = index[i];
             if (path_ptr >= PATH_MAX) {
                 context->response.status_code = 400;
+                http_response(context, NULL);
                 return;
             }
         }
         if (stat(real_path, &file_stat)) {
             context->response.status_code = 403;
+            http_response(context, NULL);
             return;
         }
     } else {
         // not found
         context->response.status_code = 404;
+        http_response(context, NULL);
         return;
     }
     int fd = open(real_path, O_RDONLY);
     if (fd < 0) {
         context->response.status_code = 404;
+        http_response(context, NULL);
         return;
     }
     // get MIME for Content-Type
@@ -456,6 +509,7 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
     } while (file_ptr < file_stat.st_size);
     reset_context(context);
 #else
+    // Normal use sysio
     // set Content-Type
     static http_header_field_t *content_type = NULL;
     if (content_type == NULL) {
@@ -469,11 +523,15 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
     context->response.headers.len = 1;
     context->response.headers.fields = content_type;
     // read all to context body
-    if (context->response.body.len < file_stat.st_size) {
+    if (context->response.body.data == NULL) {
+        context->response.body.data = (unsigned char *) malloc(file_stat.st_size);
+    } else if (context->response.body.len < file_stat.st_size) {
         context->response.body.data = (unsigned char *) realloc(context->response.body.data, file_stat.st_size);
     }
+    // TODO: handle error
     context->response.body.len = file_stat.st_size;
     read(fd, context->response.body.data, file_stat.st_size);
+    http_response(context, free_response);
 #endif
 }
 
@@ -497,7 +555,6 @@ http_server_t *http_create_server(void) {
     server->err_handler = NULL;
     server->before_parse = NULL;
     server->before_dispatch = NULL;
-    server->post_response = NULL;
     server->before_close = NULL;
     // default settings
     server->port = 80;
@@ -611,6 +668,9 @@ int http_spawn_process(http_server_t *server) {
  * @return errno
  */
 int http_server_run_multi_process(http_server_t *server, int process) {
+    if (process <= 0) {
+        return -1;
+    }
     server->socket_fd = http_server_listen(server);
     if (server->socket_fd < 0) {
         return errno;
@@ -655,17 +715,18 @@ int http_server_run_multi_process(http_server_t *server, int process) {
     return errno;
 }
 
-/*
+
 void *thread_job(void *s) {
-    http_server_t *server = (http_server_t *) s;
+    // create new server, copy original
+    http_server_t server;
+    memcpy(&server, s, sizeof(http_server_t));
     // create new loop
-    struct ev_loop *loop = ev_loop_new(0);
-    ev_io tcp_watcher;
-    ev_io_init(&tcp_watcher, tcp_accept_cb, server->socket_fd, EV_READ);
-    ev_io_start(loop, &tcp_watcher);
-    ev_run(loop, 0);
+    server.loop = ev_loop_new(0);
+    ev_io_init(&server.tcp_watcher, tcp_accept_cb, server.socket_fd, EV_READ);
+    ev_io_start(server.loop, &server.tcp_watcher);
+    ev_run(server.loop, 0);
     return NULL;
-}*/
+}
 
 /**
  * Run server in multi-thread mode.
@@ -673,28 +734,30 @@ void *thread_job(void *s) {
  * @param threads Number of threads
  * @return
  */
-/*
 int http_server_run_multi_thread(http_server_t *server, int threads) {
-   server->socket_fd = http_server_listen(server);
-   if (server->socket_fd < 0) {
-       return errno;
-   }
-   pthread_t t[threads];
-   for (int i = 0; i < threads; i++) {
-       int ret = pthread_create(&t[i], NULL, thread_job, server);
-       if (ret) {
-           if (server->err_handler != NULL) {
-               server->err_handler(ret);
-           }
-           // cancel
-           for (int j = 0; j < i; j++) {
-               pthread_cancel(t[j]);
-           }
-           return ret;
-       }
-   }
-   // TODO: wait
-}*/
+    if (threads <= 0) {
+        return -1;
+    }
+    server->socket_fd = http_server_listen(server);
+    if (server->socket_fd < 0) {
+        return errno;
+    }
+    pthread_t t[threads];
+    for (int i = 0; i < threads; i++) {
+        int ret = pthread_create(&t[i], NULL, thread_job, server);
+        if (ret) {
+            if (server->err_handler != NULL) {
+                server->err_handler(ret);
+            }
+            // cancel
+            for (int j = 0; j < i; j++) {
+                pthread_cancel(t[j]);
+            }
+            return ret;
+        }
+    }
+    return pthread_join(t[0], NULL);
+}
 
 /**
  * Run server in single-process mode.

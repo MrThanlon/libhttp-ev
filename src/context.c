@@ -148,11 +148,9 @@ const char *get_status_message(unsigned int status) {
  * @param context
  */
 void reset_context(http_context_t *context) {
-    // stop watcher
-    ev_io_stop(context->server->loop, &context->watcher);
     // call hooks
-    if (context->server->post_response != NULL) {
-        context->server->post_response(context);
+    if (context->post_response_handler != NULL) {
+        context->post_response_handler(context);
     }
     // check limitation
     if (context->requests >= context->server->max_request) {
@@ -174,8 +172,7 @@ void reset_context(http_context_t *context) {
     context->response.headers.len = 0;
     context->response.body.len = 0;
     // ev
-    ev_io_init(&context->watcher, watcher_cb, context->watcher.fd, EV_READ);
-    ev_io_start(context->server->loop, &context->watcher);
+    ev_io_modify(&context->watcher, EV_READ);
 }
 
 /**
@@ -235,6 +232,7 @@ static void timer_cb(struct ev_loop *loop, ev_timer *watcher, int revents) {
     ev_timer_stop(loop, watcher);
     http_context_t *context = get_context_from_timer(watcher);
     context->state = HTTP_CONTEXT_STATE_TIMEOUT;
+    // TODO: check state, do not close directly
     close_context(context);
 }
 
@@ -282,7 +280,6 @@ void close_context(http_context_t *context) {
     recycle_context(context);
 }
 
-
 /**
  * Dispatch context to handler.
  * @param context
@@ -307,6 +304,6 @@ void http_dispatch(http_context_t *context) {
     } else {
         // 404
         context->response.status_code = 404;
-        http_response(context);
+        http_response(context, NULL);
     }
 }
