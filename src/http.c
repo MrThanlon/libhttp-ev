@@ -152,7 +152,7 @@ void http_response(http_context_t *context, http_handler_t handler) {
  * Response with Transfer-Encoding: chunked
  * @param context
  * @param chunk
- */
+
 void http_write_chunk(http_context_t *context, http_string_t chunk) {
     context->flags |= HTTP_CONTEXT_FLAG_CHUNKED;
     if (context->state != HTTP_CONTEXT_STATE_RESPONSE) {
@@ -165,7 +165,7 @@ void http_write_chunk(http_context_t *context, http_string_t chunk) {
     write(context->watcher.fd, buffer, len);
     write(context->watcher.fd, chunk.data, chunk.len);
     write(context->watcher.fd, "\r\n", 2);
-}
+} */
 
 /**
  * Register a handler to URL.

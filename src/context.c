@@ -172,7 +172,11 @@ void reset_context(http_context_t *context) {
     context->response.headers.len = 0;
     context->response.body.len = 0;
     // ev
+#if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
     ev_io_modify(&context->watcher, EV_READ);
+#else
+    ev_io_set(&context->watcher, context->watcher.fd, EV_READ);
+#endif
 }
 
 /**
