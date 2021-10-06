@@ -41,6 +41,10 @@ void http_close_connection(http_context_t *context) {
     close_context(context);
 }
 
+const char *http_get_method_name(http_method_t method) {
+    return llhttp_method_name(method);
+}
+
 /**
  * Response to client.
  * @param context
@@ -57,13 +61,14 @@ void http_response(http_context_t *context, http_handler_t handler) {
     }
     const char *status_message = get_status_message(context->response.status_code);
     size_t status_message_len = strlen(status_message);
-    if (context->response.status_code != 200 && context->response.body.len == 0) {
+    if (context->response.status_code >= 400 && context->response.body.len == 0) {
         // TODO: use custom error page
         context->response.body.data = (unsigned char *) status_message;
         context->response.body.len = status_message_len;
     }
     // check headers len, "HTTP/1.1 xxx xxx\r\n" + "Content-Length: xxx\r\n"
-    size_t headers_len = 15 + status_message_len + 18 + (size_t) log10((double) context->response.body.len);
+    size_t headers_len = 15 + status_message_len + 18 +
+                         (size_t) log10((double) (context->response.body.len > 0 ? context->response.body.len : 1));
     // keep-alive
     if (context->server->max_request != 0) {
         // "Connection: keep-alive\r\n"
@@ -83,10 +88,10 @@ void http_response(http_context_t *context, http_handler_t handler) {
         headers_len += context->response.headers.fields[i].key.len +
                        context->response.headers.fields[i].value.len + 4;
     }
-    if (context->buffer_capacity < headers_len) {
+    if (context->buffer_capacity < headers_len + context->request_len) {
         // expansion
-        context->buffer_capacity = headers_len;
-        char *new_buffer = realloc(context->buffer, headers_len);
+        context->buffer_capacity = headers_len + context->request_len;
+        char *new_buffer = realloc(context->buffer, headers_len + context->request_len);
         if (new_buffer == NULL) {
             if (context->server->err_handler != NULL) {
                 context->server->err_handler(errno);
@@ -97,11 +102,12 @@ void http_response(http_context_t *context, http_handler_t handler) {
         context->buffer = new_buffer;
     }
     // first line and Content-Length
-    context->buffer_ptr = sprintf(context->buffer,
-                                  "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n",
-                                  context->response.status_code,
-                                  status_message,
-                                  context->response.body.len);
+    // FIXME: use another buffer, do not offset
+    context->buffer_ptr += sprintf(context->buffer + context->buffer_ptr,
+                                   "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n",
+                                   context->response.status_code,
+                                   status_message,
+                                   context->response.body.len);
     // keep-alive
     if (context->server->max_request != 0) {
         // "Connection: keep-alive\r\n"
@@ -110,7 +116,7 @@ void http_response(http_context_t *context, http_handler_t handler) {
         if (context->server->max_request > 0) {
             // "Keep-Alive: timeout=xx, max=xx\r\n"
             context->buffer_ptr += sprintf(context->buffer + context->buffer_ptr,
-                                           "Keep-Alive: timeout=%d, max=%d",
+                                           "Keep-Alive: timeout=%d, max=%d\r\n",
                                            context->server->client_timeout,
                                            context->server->max_request);
         }
@@ -137,10 +143,17 @@ void http_response(http_context_t *context, http_handler_t handler) {
     // last CRLF
     memcpy(context->buffer + context->buffer_ptr, "\r\n", 2);
     context->buffer_ptr += 2;
+    // reset write_ptr
+    context->write_ptr = 0;
     // handler
     context->post_response_handler = handler;
     // ev
-    ev_io_init(&context->watcher, watcher_cb, context->watcher.fd, EV_WRITE);
+    ev_io_stop(context->server->loop, &context->watcher);
+#if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
+    ev_io_modify(&context->watcher, EV_WRITE);
+#else
+    ev_io_set(&context->watcher, context->watcher.fd, EV_WRITE);
+#endif
     ev_io_start(context->server->loop, &context->watcher);
 }
 

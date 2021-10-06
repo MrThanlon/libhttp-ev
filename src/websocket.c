@@ -31,11 +31,23 @@ void ws_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
     if (wslay_event_want_write(ws->context)) {
         events |= EV_WRITE;
     }
+    ev_io_stop(loop, watcher);
+    if (events == 0) {
+        // close
+        close_context(ws->http_context);
+        // call hook
+        if (ws->handlers->on_close != NULL) {
+            ws->handlers->on_close(ws);
+        }
+        free(ws);
+        return;
+    }
 #if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
     ev_io_modify(watcher, events);
 #else
     ev_io_set(watcher, watcher->fd, events);
 #endif
+    ev_io_start(loop, watcher);
 }
 
 /*
@@ -130,12 +142,32 @@ struct wslay_event_callbacks ws_callbacks = {
 };
 
 static void ws_post_response(http_context_t *context) {
+    // find handlers based on url
+    http_url_trie_node_t *node = &context->server->url_root;
+    http_ws_handlers_t *handlers = NULL;
+    size_t idx = 1;
+    while (idx <= context->request.url.len && node != NULL) {
+        if (node->ws_handlers != NULL) {
+            handlers = node->ws_handlers;
+        }
+        node = node->children[context->request.url.data[idx] - '%'];
+        idx += 1;
+    }
+    if (handlers == NULL) {
+        // FIXME: should be 404, match url before response
+        close_context(context);
+        return;
+    }
     // generate ws context
     http_ws_t *ws = malloc(sizeof(http_ws_t));
     if (ws == NULL) {
         // error
         close_context(context);
+        return;
     }
+    ws->handlers = handlers;
+    ws->server = context->server;
+    ws->http_context = context;
     // copy template
     memcpy(&ws->callbacks, &ws_callbacks, sizeof(struct wslay_event_callbacks));
     if (wslay_event_context_server_init(&ws->context, &ws->callbacks, ws)) {
@@ -144,32 +176,32 @@ static void ws_post_response(http_context_t *context) {
         return;
     }
     // ev
-    int fd = context->watcher.fd;
-    ev_io_stop(context->server->loop, &context->watcher);
-    ev_io_init(&context->watcher, ws_cb, fd, EV_READ | EV_WRITE);
-    ev_io_start(context->server->loop, &context->watcher);
-    // find handlers based on url
-    http_url_trie_node_t *node = &context->server->url_root;
-    http_ws_handlers_t *handlers = NULL;
-    size_t idx = 1;
-    while (idx < context->request.url.len && node != NULL) {
-        if (node->ws_handlers != NULL) {
-            handlers = node->ws_handlers;
-        }
-        node = node->children[context->request.url.data[idx] - '%'];
-        idx += 1;
+    // reset timer
+    if (ev_is_active(&context->timer)) {
+        ev_timer_stop(context->server->loop, &context->timer);
     }
-    ws->handlers = handlers;
+    /*
+    if (context->server->ws_timeout > 0) {
+        ev_timer_init(&ws->timer, timer_cb, context->server->ws_timeout, 0);
+    }*/
+    // use ws_cb
+    int fd = context->watcher.fd;
+    ev_io_init(&ws->watcher, ws_cb, fd, EV_READ);
+    ev_io_stop(context->server->loop, &context->watcher);
+    ev_io_start(ws->server->loop, &ws->watcher);
     // call on_connection hooks
     if (handlers->on_connection != NULL) {
         handlers->on_connection(ws);
     }
+    // set state, FIXME: use another way
+    context->state = HTTP_CONTEXT_STATE_PENDING;
     // free headers
     free(context->response.headers.fields[2].value.data);
 }
 
 int ws_handshake(http_context_t *context) {
     // TODO: handshake, create ws
+    // TODO: match url
     // find header field
     http_header_field_t *fields = context->request.headers.fields;
     int success = 0;
@@ -190,6 +222,7 @@ int ws_handshake(http_context_t *context) {
                    fields[i].value.len == 24 &&
                    memcmp(fields[i].key.data, "Sec-WebSocket-Key", 17) == 0) {
             // Sec-WebSocket-Key: xxx(24 chars)
+            success += 1;
             key = (const char *) fields[i].value.data;
         }
     }
@@ -198,7 +231,7 @@ int ws_handshake(http_context_t *context) {
         return -1;
     }
     // generate headers
-    // copy from template
+    // copy headers from template
     memcpy(&context->response.headers, &ws_headers, sizeof(http_headers_t));
     unsigned char *accept_key = malloc(28);
     if (accept_key == NULL) {
@@ -222,6 +255,7 @@ int ws_handshake(http_context_t *context) {
     base64_encode_raw((char *) accept_key, 20, sha1buf);
     // response
     context->response.status_code = 101;
+    context->response.body.len = 0;
     http_response(context, ws_post_response);
     return 0;
 }

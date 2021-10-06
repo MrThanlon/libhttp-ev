@@ -56,8 +56,14 @@ int body_cb(llhttp_t *parser, const char *at, size_t length) {
 }
 
 int message_complete_cb(llhttp_t *parser) {
+    // FIXME: dispatch after parse
     http_context_t *context = get_context_from_parser(parser);
+    // go next step
+    context->state = HTTP_CONTEXT_STATE_HANDLING;
+    context->request_len = context->buffer_ptr;
+    time(&context->last_request);
     context->requests += 1;
+    /*
     http_server_t *server = context->server;
     // TODO: handle exceed data, part of HTTP/2
     // call before_dispatch()
@@ -68,6 +74,6 @@ int message_complete_cb(llhttp_t *parser) {
         }
     }
     // dispatch
-    http_dispatch(context);
+    http_dispatch(context);*/
     return 0;
 }

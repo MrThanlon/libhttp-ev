@@ -152,8 +152,12 @@ void reset_context(http_context_t *context) {
     if (context->post_response_handler != NULL) {
         context->post_response_handler(context);
     }
+    if (context->state == HTTP_CONTEXT_STATE_PENDING) {
+        // for websocket, do nothing
+        return;
+    }
     // check limitation
-    if (context->requests >= context->server->max_request) {
+    if (context->server->max_request > 0 && context->requests >= context->server->max_request) {
         // close
         close_context(context);
         return;
@@ -172,11 +176,15 @@ void reset_context(http_context_t *context) {
     context->response.headers.len = 0;
     context->response.body.len = 0;
     // ev
+    ev_io_stop(context->server->loop, &context->watcher);
 #if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
     ev_io_modify(&context->watcher, EV_READ);
 #else
     ev_io_set(&context->watcher, context->watcher.fd, EV_READ);
 #endif
+    ev_io_start(context->server->loop, &context->watcher);
+    // write_ptr
+    context->write_ptr = 0;
 }
 
 /**
@@ -231,10 +239,10 @@ static http_context_t *get_context_from_timer(ev_timer *watcher) {
     return (http_context_t *) ((void *) watcher - offsetof(http_context_t, timer));
 }
 
-static void timer_cb(struct ev_loop *loop, ev_timer *watcher, int revents) {
-    // timeout, close
-    ev_timer_stop(loop, watcher);
+void timer_cb(struct ev_loop *loop, ev_timer *watcher, int revents) {
+    // timeout, check last request time
     http_context_t *context = get_context_from_timer(watcher);
+    ev_timer_stop(loop, watcher);
     context->state = HTTP_CONTEXT_STATE_TIMEOUT;
     // TODO: check state, do not close directly
     close_context(context);
@@ -261,8 +269,11 @@ http_context_t *http_create_context(http_server_t *server, int socket_fd) {
     llhttp_init(&context->parser, HTTP_REQUEST, &server->parser_settings);
     // ev
     // timer
-    ev_timer_init(&context->timer, timer_cb, server->client_timeout, 0);
-    ev_timer_start(server->loop, &context->timer);
+    if (server->client_timeout > 0) {
+        // not greater than 0 means unlimited
+        ev_timer_init(&context->timer, timer_cb, server->client_timeout, 0);
+        ev_timer_start(server->loop, &context->timer);
+    }
     // socket
     ev_io_init(&context->watcher, watcher_cb, socket_fd, EV_READ);
     ev_io_start(server->loop, &context->watcher);
@@ -274,6 +285,10 @@ http_context_t *http_create_context(http_server_t *server, int socket_fd) {
  * @param context
  */
 void close_context(http_context_t *context) {
+    // clear timer
+    if (ev_is_active(&context->timer)) {
+        ev_timer_stop(context->server->loop, &context->timer);
+    }
     // call hooks
     if (context->server->before_close != NULL) {
         context->server->before_close(context);
@@ -293,7 +308,7 @@ void http_dispatch(http_context_t *context) {
     http_url_trie_node_t *node = &context->server->url_root;
     http_handler_t handler = node->handler;
     size_t idx = 1;
-    while (idx < context->request.url.len && node != NULL) {
+    while (idx <= context->request.url.len && node != NULL) {
         if (node->handler != NULL) {
             handler = node->handler;
         }
@@ -304,7 +319,9 @@ void http_dispatch(http_context_t *context) {
     if (handler != NULL) {
         context->state = HTTP_CONTEXT_STATE_HANDLING;
         handler(context);
-        context->state = HTTP_CONTEXT_STATE_PENDING;
+        if (context->state == HTTP_CONTEXT_STATE_HANDLING) {
+            context->state = HTTP_CONTEXT_STATE_PENDING;
+        }
     } else {
         // 404
         context->response.status_code = 404;

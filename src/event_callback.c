@@ -24,21 +24,22 @@ int set_non_block(int fd) {
 
 static void tcp_write_cb(http_context_t *context) {
     // FIXME: one pass write(?)
-    if (context->write_ptr < context->buffer_ptr) {
-        // write buffer
+    size_t headers_buffer_ptr = context->buffer_ptr - context->request_len;
+    if (context->write_ptr < headers_buffer_ptr) {
+        // write headers buffer
         context->write_ptr += write(context->watcher.fd,
-                                    context->buffer + context->write_ptr,
-                                    context->buffer_ptr - context->write_ptr);
+                                    context->buffer + context->request_len + context->write_ptr,
+                                    headers_buffer_ptr - context->write_ptr);
     }
-    if (context->write_ptr >= context->buffer_ptr &&
-        context->write_ptr < context->buffer_ptr + context->response.body.len) {
+    if (context->write_ptr >= headers_buffer_ptr &&
+        context->write_ptr < headers_buffer_ptr + context->response.body.len) {
         // write response
-        size_t response_ptr = context->write_ptr - context->buffer_ptr;
+        size_t response_ptr = context->write_ptr - headers_buffer_ptr;
         context->write_ptr += write(context->watcher.fd,
                                     context->response.body.data + response_ptr,
                                     context->response.body.len - response_ptr);
     }
-    if (context->write_ptr >= context->buffer_ptr + context->response.body.len) {
+    if (context->write_ptr >= headers_buffer_ptr + context->response.body.len) {
         // finish
         reset_context(context);
     }
@@ -64,14 +65,16 @@ static void tcp_read_cb(http_context_t *context) {
         close_context(context);
     } else {
         // received
+        size_t offset = context->buffer_ptr;
+        context->buffer_ptr += bytes;
         // TODO: check header field size
-        if (context->buffer_ptr + bytes >= context->server->max_request_size) {
+        if (context->server->max_request_size > 0 && context->buffer_ptr + bytes >= context->server->max_request_size) {
             // exceed
             context->response.status_code = 413;
             http_response(context, NULL);
             return;
         }
-        if (context->buffer_ptr + bytes >= context->buffer_capacity) {
+        if (context->buffer_ptr >= context->buffer_capacity) {
             // expansion
             context->buffer_capacity += BUFFER_SIZE;
             char *new_buffer = (char *) realloc(context->buffer, context->buffer_capacity);
@@ -87,25 +90,40 @@ static void tcp_read_cb(http_context_t *context) {
         }
         // execute parser
         context->state = HTTP_CONTEXT_STATE_PARSE;
-        enum llhttp_errno err = llhttp_execute(&context->parser, context->buffer + context->buffer_ptr, bytes);
+        enum llhttp_errno err = llhttp_execute(&context->parser, context->buffer + offset, bytes);
         if (context->state == HTTP_CONTEXT_STATE_CLOSED) {
             close_context(context);
             return;
         }
         if (err == HPE_OK) {
-            context->buffer_ptr += bytes;
-        } else if (err == HPE_PAUSED_UPGRADE) {
-            // maybe websocket, handshake, stop context
-            if (ws_handshake(context)) {
-                // error, close
-                if (context->server->err_handler != NULL) {
-                    context->server->err_handler(errno);
+            if (context->state == HTTP_CONTEXT_STATE_HANDLING) {
+                // dispatch
+                http_server_t *server = context->server;
+                // TODO: handle exceed data, part of HTTP/2
+                // call before_dispatch()
+                if (server->before_dispatch != NULL) {
+                    server->before_dispatch(context);
+                    if (context->state == HTTP_CONTEXT_STATE_CLOSED) {
+                        close_context(context);
+                        return;
+                    }
                 }
-                close_context(context);
-                return;
+                // dispatch
+                http_dispatch(context);
             }
-            // pending
-            context->state = HTTP_CONTEXT_STATE_PENDING;
+            // continue receiving
+        } else if (err == HPE_PAUSED_UPGRADE) {
+            if (context->state == HTTP_CONTEXT_STATE_HANDLING) {
+                // maybe websocket, handshake, stop context
+                if (ws_handshake(context)) {
+                    // error, close
+                    if (context->server->err_handler != NULL) {
+                        context->server->err_handler(errno);
+                    }
+                    close_context(context);
+                }
+                // handshake, done
+            }
         } else {
             // error, close
             if (context->server->err_handler != NULL) {
@@ -153,7 +171,7 @@ void tcp_accept_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
         }
         return;
     }
-    if (server->connections >= server->max_connections) {
+    if (server->max_connections > 0 && server->connections >= server->max_connections) {
         // close
         close(client_fd);
         return;

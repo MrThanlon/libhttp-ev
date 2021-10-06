@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 
+#include <time.h>
 #include <ev.h>
 #include <llhttp.h>
 #include <wslay/wslay.h>
@@ -76,6 +77,7 @@ struct http_context_s {
     ev_timer timer;
     llhttp_t parser;
     http_server_t *server;
+    size_t request_len;
     http_request_t request;
     http_response_t response;
     http_context_state_t state;
@@ -85,6 +87,8 @@ struct http_context_s {
     char *buffer;
     size_t buffer_ptr;
     size_t buffer_capacity;
+    time_t last_request;
+    time_t create_time;
     unsigned int flags;
 };
 
@@ -140,6 +144,7 @@ int http_server_run_multi_process(http_server_t *server, int process);
 int http_server_run_multi_thread(http_server_t *server, int threads);
 int http_server_run_single_process(http_server_t *server);
 void http_send_dir(http_context_t *context, const char *path, const char *index);
+const char* http_get_method_name(http_method_t method);
 void http_close_connection(http_context_t *context);
 void http_response(http_context_t *context, http_handler_t handler);
 void http_ws_write(http_ws_t *ws, uint8_t opcode, const uint8_t *message, size_t len);
