@@ -19,7 +19,7 @@ FetchContent_MakeAvailable(wslay)
 # ev
 find_package(Libev REQUIRED)
 # nettle
-find_package(NETTLE REQUIRED)
+find_package(Nettle REQUIRED)
 
 target_include_directories(${PROJECT_NAME} PUBLIC include ${LIBEV_INCLUDE_DIRS} ${NETTLE_INCLUDE_DIR})
 target_link_libraries(${PROJECT_NAME} llhttp wslay ${LIBEV_LIBRARIES} ${NETTLE_LIBRARIES})
