@@ -8,7 +8,7 @@ file(GLOB_RECURSE SOURCES "src/*.*")
 add_library(${PROJECT_NAME} STATIC ${SOURCES})
 
 # dependency
-set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/;${CMAKE_MODULE_PATH}")
+set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/;${CMAKE_MODULE_PATH}")
 include(FetchContent)
 # llhttp
 FetchContent_Declare(llhttp URL "https://github.com/nodejs/llhttp/archive/refs/tags/release/v6.0.5.tar.gz")
