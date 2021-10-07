@@ -90,6 +90,7 @@ struct http_context_s {
     time_t last_request;
     time_t create_time;
     unsigned int flags;
+    void *userdata;
 };
 
 struct http_ws_handlers_s {
@@ -106,6 +107,7 @@ struct http_ws_s {
     wslay_event_context_ptr context;
     http_context_t *http_context;
     http_ws_handlers_t *handlers;
+    void *userdata;
 };
 
 struct http_url_trie_node_s {
