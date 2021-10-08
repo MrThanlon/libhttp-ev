@@ -152,7 +152,7 @@ void reset_context(http_context_t *context) {
     if (context->post_response_handler != NULL) {
         context->post_response_handler(context);
     }
-    if (context->state == HTTP_CONTEXT_STATE_PENDING) {
+    if (context->state != HTTP_CONTEXT_STATE_RESPONSE) {
         // for websocket, do nothing
         return;
     }
@@ -294,7 +294,10 @@ void close_context(http_context_t *context) {
         context->server->before_close(context);
     }
     context->state = HTTP_CONTEXT_STATE_CLOSED;
-    ev_io_stop(context->server->loop, &context->watcher);
+    // unnecessary, for websocket
+    if (ev_is_active(&context->watcher)) {
+        ev_io_stop(context->server->loop, &context->watcher);
+    }
     close(context->watcher.fd);
     recycle_context(context);
 }
