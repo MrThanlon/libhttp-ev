@@ -1,0 +1,26 @@
+digraph {
+    node [shape = doublecircle width=1 height=1];
+    closed;
+
+    node [shape = circle width=1 height=1];
+    waiting -> parsing [label = "new request"];
+
+    parsing -> handling; 
+    parsing -> response [label = "not found"];
+    parsing -> websocket [label = "websocket"];
+
+    websocket -> closed [label = "http_close()"];
+
+    handling -> pending;
+    handling -> response [label = "http_response()"];
+    handling -> closed [label = "http_close()"];
+
+    response -> waiting;
+    response -> closed [label = "http_close()"];
+
+    pending -> response [label = "http_response()"];
+    parsing -> closed [label = "error"];
+    pending -> closed [label = "http_close()"];
+
+    closed -> waiting [label = "new connection"];
+}

@@ -118,6 +118,13 @@ void http_ws_write(http_ws_t *ws, uint8_t opcode, const uint8_t *message, size_t
     struct wslay_event_msg msg = {
             .opcode=opcode, .msg=message, .msg_length=len
     };
+    ev_io_stop(ws->server->loop, &ws->watcher);
+#if EV_VERSION_MAJOR >= 4 && EV_VERSION_MINOR >= 32
+    ev_io_modify(&ws->watcher, EV_READ | EV_WRITE);
+#else
+    ev_io_set(&ws->watcher, ws->watcher.fd, EV_READ | EV_WRITE);
+#endif
+    ev_io_start(ws->server->loop, &ws->watcher);
     wslay_event_queue_msg(ws->context, &msg);
 }
 

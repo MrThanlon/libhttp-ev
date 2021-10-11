@@ -440,6 +440,13 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
                 return;
             }
         }
+        // postfix '\0'
+        real_path[path_ptr++] = '\0';
+        if (path_ptr >= PATH_MAX) {
+          context->response.status_code = 400;
+          http_response(context, NULL);
+          return;
+        }
         if (stat(real_path, &file_stat)) {
             context->response.status_code = 403;
             http_response(context, NULL);
@@ -487,19 +494,21 @@ void http_send_dir(http_context_t *context, const char *path, const char *index)
             .trailers = NULL,
             .trl_cnt = 0
     };
+    // FIXME: use write callback
+    context->flags |= HTTP_CONTEXT_FLAG_FILE;
     do {
-        int err = sendfile(fd, context->watcher.fd, file_ptr, &file_len, &hdtr, 0);
-        if (err != 0 && err != EAGAIN) {
-            // error
-            close(fd);
-            if (context->server->err_handler != NULL) {
-                context->server->err_handler(err);
-            }
-            context->response.status_code = 500;
-            return;
+      int err = sendfile(fd, context->watcher.fd, file_ptr, &file_len, &hdtr, 0);
+      if (err != 0 && err != EAGAIN) {
+        // error
+        close(fd);
+        if (context->server->err_handler != NULL) {
+          context->server->err_handler(err);
         }
-        file_ptr += file_len;
-        file_len = file_stat.st_size - file_len;
+        context->response.status_code = 500;
+        return;
+      }
+      file_ptr += file_len;
+      file_len = file_stat.st_size - file_len;
     } while (file_ptr < file_stat.st_size);
 #elif __linux__
     size_t file_len = file_stat.st_size;

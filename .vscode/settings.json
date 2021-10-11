@@ -1,0 +1,10 @@
+{
+    "C_Cpp.default.includePath": [
+        "include",
+        "/usr/local/include",
+        "cmake-build-debug/_deps/llhttp-src/include"
+    ],
+    "files.associations": {
+        "http.h": "c"
+    }
+}

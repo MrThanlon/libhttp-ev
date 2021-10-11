@@ -60,7 +60,8 @@ struct http_response_s {
 typedef enum {
     HTTP_CONTEXT_FLAG_KEEPALIVE = 1,
     HTTP_CONTEXT_FLAG_CHUNKED = 2,
-    } http_context_flag_t;
+    HTTP_CONTEXT_FLAG_FILE = 4
+} http_context_flag_t;
 
 typedef enum {
     HTTP_CONTEXT_STATE_WAIT = 0,
